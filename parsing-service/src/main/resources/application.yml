@@ -1,0 +1,125 @@
+# application.yml - Parsing Service
+
+server:
+  port: 8082   # 8081=ingestion, 8082=parsing, 8083=categorization, 8084=analytics, 8080=gateway
+
+spring:
+  application:
+    name: parsing-service
+
+  threads:
+    virtual:
+      # Applies to both the (minimal) web server used only for Actuator,
+      # AND to Spring Kafka's listener container when
+      # spring.kafka.listener.type=single with a virtual-thread task
+      # executor configured in KafkaConsumerConfig - keeps chunk-level
+      # LLM calls from tying up limited platform threads while waiting
+      # on network I/O.
+      enabled: true
+
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:financetracker}
+    username: ${DB_USER:finance_app}
+    password: ${DB_PASS:finance_app_pw}
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 5
+      connection-timeout: 30000
+      idle-timeout: 600000
+      max-lifetime: 1800000
+      leak-detection-threshold: 60000
+
+  jpa:
+    hibernate:
+      ddl-auto: validate   # schema owned exclusively by Flyway - see db/migration
+    show-sql: false
+    properties:
+      hibernate:
+        jdbc:
+          batch_size: 50
+          order_inserts: true
+          order_updates: true
+        default_batch_fetch_size: 20
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+    baseline-version: 0
+    # Each microservice that shares this physical Postgres instance uses
+    # its OWN Flyway history table (rather than the default shared
+    # `flyway_schema_history`), so ingestion-service's and
+    # parsing-service's migration histories never collide or get
+    # confused with each other, even though they're two Flyway-managed
+    # schemas living in the same database.
+    table: flyway_schema_history_parsing
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    consumer:
+      group-id: parsing-service
+      auto-offset-reset: earliest
+      # We deserialize manually inside the listener via ObjectMapper
+      # instead of relying on Spring Kafka's JsonDeserializer type
+      # headers - see StatementIngestedListener javadoc for why (the
+      # short version: the producer's type header points at
+      # ingestion-service's package, which doesn't exist on this
+      # service's classpath).
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      acks: all
+      retries: 3
+      properties:
+        enable.idempotence: true
+    listener:
+      # Manual ack mode: we only commit a chunk's offset back to Kafka
+      # after it has been fully parsed AND persisted AND its
+      # transaction.parsed events published - if the process crashes
+      # mid-way, redelivery picks up exactly where it left off instead
+      # of silently skipping a partially-processed statement.
+      ack-mode: manual
+
+finance-tracker:
+  kafka:
+    topics:
+      statement-ingested: statement.ingested
+      transaction-parsed: transaction.parsed
+      # Dead-letter topic: any statement.ingested event that fails
+      # parsing after Kafka's built-in retry attempts lands here instead
+      # of blocking the consumer group forever on a single poison message.
+      statement-ingested-dlt: statement.ingested.DLT
+
+  llm:
+    # Matches the "local / api call" branch point sketched in the
+    # original design notes: pointing base-url at a local model server
+    # (e.g. Ollama/LM Studio on http://localhost:11434) or a hosted API
+    # is purely a config change, no code change, thanks to LlmClientConfig
+    # using a single configurable RestClient bean.
+    chat:
+      base-url: ${LLM_CHAT_BASE_URL:http://localhost:11434}
+      model: ${LLM_CHAT_MODEL:llama3.1}
+      api-key: ${LLM_CHAT_API_KEY:}
+      timeout-seconds: 60
+    embedding:
+      base-url: ${LLM_EMBEDDING_BASE_URL:http://localhost:11434}
+      model: ${LLM_EMBEDDING_MODEL:nomic-embed-text}
+      api-key: ${LLM_EMBEDDING_API_KEY:}
+      dimensions: 1536
+      timeout-seconds: 30
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always
+
+logging:
+  level:
+    com.financetracker: DEBUG
+    org.hibernate.SQL: WARN

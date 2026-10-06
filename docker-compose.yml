@@ -1,0 +1,291 @@
+########################################################################
+# docker-compose.yml
+#
+# This file spins up all the SHARED INFRASTRUCTURE for the finance
+# tracker platform. Individual microservices (ingestion-service,
+# parsing-service, categorization-service, analytics-service,
+# api-gateway) each have their own docker-compose / Dockerfile and
+# connect to these shared containers over the `finance-net` network.
+#
+# Services defined here:
+#   1. postgres   - Single Postgres instance holding BOTH the relational
+#                    tables (bank_statements, transactions, categories)
+#                    AND the vector embeddings (via the pgvector
+#                    extension). Using one database instead of a
+#                    separate vector store keeps transactions and their
+#                    embeddings joinable in a single SQL query, and
+#                    avoids running/operating a second stateful system.
+#   2. kafka       - Event backbone connecting the microservices.
+#                    Running in KRaft mode (no Zookeeper needed - this
+#                    is the modern, simplified way to run Kafka).
+#   3. kafka-ui    - A web UI (localhost:8090) to watch topics, consumer
+#                    groups and messages flow in real time. Extremely
+#                    useful while wiring up the pipeline, and doubles as
+#                    a reference for what your custom "live Kafka
+#                    visuals" dashboard page needs to replicate.
+########################################################################
+
+version: '3.9'
+
+services:
+
+  # ----------------------------------------------------------------
+  # PostgreSQL + pgvector
+  # ----------------------------------------------------------------
+  postgres:
+    # pgvector/pgvector ships Postgres 16 with the `vector` extension
+    # pre-installed, so we don't have to compile/install it ourselves.
+    image: pgvector/pgvector:pg16
+    container_name: finance-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: financetracker
+      POSTGRES_USER: finance_app
+      POSTGRES_PASSWORD: finance_app_pw   # local dev only - use secrets in real deployments
+    ports:
+      - "5432:5432"
+    volumes:
+      # Named volume so data survives `docker compose down` (but not `-v`)
+      - pgdata:/var/lib/postgresql/data
+      # Runs once on first container start: enables the pgvector extension
+      # so every service's Flyway migration can safely `CREATE EXTENSION
+      # IF NOT EXISTS vector` without needing superuser rights at runtime.
+      - ./infra/postgres/init-extensions.sql:/docker-entrypoint-initdb.d/init-extensions.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U finance_app -d financetracker"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - finance-net
+
+  # ----------------------------------------------------------------
+  # Kafka (KRaft mode - single node, combined broker+controller)
+  # ----------------------------------------------------------------
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: finance-kafka
+    restart: unless-stopped
+    ports:
+      - "9092:9092"        # client connections (from your services)
+      - "9093:9093"        # internal controller port
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      # Single-node dev cluster -> replication factor of 1 everywhere
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+    networks:
+      - finance-net
+
+  # ----------------------------------------------------------------
+  # Kafka UI - visualize topics/messages while developing
+  # ----------------------------------------------------------------
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: finance-kafka-ui
+    restart: unless-stopped
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: finance-cluster
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - finance-net
+
+  # ----------------------------------------------------------------
+  # Ingestion Service - the first microservice we've built out.
+  # Build context is the repo root (this directory) since the
+  # multi-module Maven build needs both the parent pom.xml and the
+  # ingestion-service/ module visible - see ingestion-service/Dockerfile.
+  # ----------------------------------------------------------------
+  ingestion-service:
+    build:
+      context: .
+      dockerfile: ingestion-service/Dockerfile
+    container_name: finance-ingestion-service
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: financetracker
+      DB_USER: finance_app
+      DB_PASS: finance_app_pw
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      UPLOAD_DIR: /data/uploads
+      # OCR Configuration
+      FINANCE_TRACKER_OCR_ENABLED: "true"
+      FINANCE_TRACKER_OCR_LANGUAGE: "eng"
+      FINANCE_TRACKER_OCR_DPI: "300"
+    volumes:
+      # Persist uploaded statement files outside the container filesystem.
+      - uploads:/data/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    networks:
+      - finance-net
+
+  # ----------------------------------------------------------------
+  # Parsing Service - consumes statement.ingested, calls the LLM,
+  # writes structured transactions + pgvector embeddings, publishes
+  # transaction.parsed. Build context is the repo root, same reason
+  # as ingestion-service (multi-module Maven build).
+  # ----------------------------------------------------------------
+  parsing-service:
+    build:
+      context: .
+      dockerfile: parsing-service/Dockerfile
+    container_name: finance-parsing-service
+    restart: unless-stopped
+    ports:
+      - "8082:8082"
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: financetracker
+      DB_USER: finance_app
+      DB_PASS: finance_app_pw
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      # Point these at your local model server (e.g. Ollama on the host)
+      # or swap in a hosted provider's URL + key - see application.yml.
+      LLM_CHAT_BASE_URL: ${LLM_CHAT_BASE_URL:-http://host.docker.internal:11434}
+      LLM_CHAT_MODEL: ${LLM_CHAT_MODEL:-llama3.1}
+      LLM_EMBEDDING_BASE_URL: ${LLM_EMBEDDING_BASE_URL:-http://host.docker.internal:11434}
+      LLM_EMBEDDING_MODEL: ${LLM_EMBEDDING_MODEL:-nomic-embed-text}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      ingestion-service:
+        condition: service_started
+    networks:
+      - finance-net
+
+  # ----------------------------------------------------------------
+  # Categorization Service - consumes transaction.parsed, LLM-assigns
+  # categories, flags unrecognized ones for your review.
+  # ----------------------------------------------------------------
+  categorization-service:
+    build:
+      context: .
+      dockerfile: categorization-service/Dockerfile
+    container_name: finance-categorization-service
+    restart: unless-stopped
+    ports:
+      - "8083:8083"
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: financetracker
+      DB_USER: finance_app
+      DB_PASS: finance_app_pw
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      LLM_CHAT_BASE_URL: ${LLM_CHAT_BASE_URL:-http://host.docker.internal:11434}
+      LLM_CHAT_MODEL: ${LLM_CHAT_MODEL:-llama3.1}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      parsing-service:
+        condition: service_started
+    networks:
+      - finance-net
+
+  # ----------------------------------------------------------------
+  # Analytics Service - read-only aggregation endpoints for the dashboard.
+  # ----------------------------------------------------------------
+  analytics-service:
+    build:
+      context: .
+      dockerfile: analytics-service/Dockerfile
+    container_name: finance-analytics-service
+    restart: unless-stopped
+    ports:
+      - "8084:8084"
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: financetracker
+      DB_USER: finance_app
+      DB_PASS: finance_app_pw
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # Started (not just healthy) after the write-side services, so
+      # their Flyway migrations have a head start creating the tables
+      # this read-only service queries. Not a hard guarantee on a fresh
+      # DB - if you hit "relation does not exist" on first-ever startup,
+      # just restart this one container once the others have finished migrating.
+      parsing-service:
+        condition: service_started
+      categorization-service:
+        condition: service_started
+    networks:
+      - finance-net
+
+  # ----------------------------------------------------------------
+  # API Gateway - the ONLY service meant to be called from outside
+  # docker-compose. Routes to ingestion-service and categorization-service,
+  # and hosts the live Kafka-events WebSocket for the dashboard.
+  # ----------------------------------------------------------------
+  api-gateway:
+    build:
+      context: .
+      dockerfile: api-gateway/Dockerfile
+    container_name: finance-api-gateway
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      INGESTION_SERVICE_URL: http://ingestion-service:8081
+      CATEGORIZATION_SERVICE_URL: http://categorization-service:8083
+      ANALYTICS_SERVICE_URL: http://analytics-service:8084
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      DASHBOARD_ORIGIN: ${DASHBOARD_ORIGIN:-http://localhost:5173}
+      DATABASE_URL: jdbc:postgresql://postgres:5432/financetracker
+      DATABASE_USERNAME: finance_app
+      DATABASE_PASSWORD: finance_app_pw
+      JWT_SECRET: ${JWT_SECRET:-your-256-bit-secret-key-change-this-in-production-minimum-32-characters-long}
+    depends_on:
+      ingestion-service:
+        condition: service_started
+      categorization-service:
+        condition: service_started
+      analytics-service:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - finance-net
+
+networks:
+  finance-net:
+    driver: bridge
+
+volumes:
+  pgdata:
+  uploads:

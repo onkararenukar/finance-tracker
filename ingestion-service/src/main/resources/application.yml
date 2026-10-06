@@ -1,0 +1,131 @@
+# application.yml - Ingestion Service
+#
+# Every value that changes between environments (local/docker/prod) is
+# pulled from an environment variable with a sensible local-dev default
+# after the colon, e.g. ${DB_USER:finance_app}. This means the exact
+# same jar/image runs correctly locally, in docker-compose, and in a
+# real deployment - only the environment variables change.
+
+server:
+  port: 8081   # Each microservice gets its own fixed port for local dev.
+               # 8081=ingestion, 8082=parsing, 8083=categorization,
+               # 8084=analytics, 8080=api-gateway (the public entrypoint).
+
+spring:
+  application:
+    name: ingestion-service
+
+  threads:
+    virtual:
+      # Java 24 / Project Loom: Tomcat handles each request on a cheap
+      # virtual thread instead of a pooled OS platform thread. Ideal
+      # here because request handling is I/O-bound (multipart upload
+      # reads, disk writes) - see IngestionServiceApplication javadoc.
+      enabled: true
+
+  # ------------------------------------------------------------------
+  # Datasource / Postgres
+  # ------------------------------------------------------------------
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:financetracker}
+    username: ${DB_USER:finance_app}
+    password: ${DB_PASS:finance_app_pw}
+    hikari:
+      # Pool sizing formula: (core_count * 2) + effective_spindle_count.
+      # 10 is a safe default for a small service on modest hardware -
+      # tune upward only if connection-wait metrics show pool exhaustion.
+      maximum-pool-size: 10
+      minimum-idle: 5
+      connection-timeout: 30000       # fail fast after 30s rather than hang
+      idle-timeout: 600000            # 10 min
+      max-lifetime: 1800000           # 30 min - must be < Postgres's idle_in_transaction_session_timeout
+      leak-detection-threshold: 60000 # warn if a connection is held > 60s (likely a leak)
+
+  # ------------------------------------------------------------------
+  # JPA / Hibernate
+  # ------------------------------------------------------------------
+  jpa:
+    hibernate:
+      # IMPORTANT: 'validate', never 'create'/'update'. Schema changes
+      # are owned exclusively by Flyway migrations (see db/migration/).
+      # Hibernate just checks the entities match what Flyway created.
+      ddl-auto: validate
+    show-sql: false
+    properties:
+      hibernate:
+        jdbc:
+          batch_size: 50        # batches inserts/updates into fewer round-trips
+          order_inserts: true
+          order_updates: true
+        default_batch_fetch_size: 20   # avoids N+1 when lazily loading collections
+
+  # ------------------------------------------------------------------
+  # Flyway - versioned schema migrations
+  # ------------------------------------------------------------------
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+    baseline-version: 0
+
+  # ------------------------------------------------------------------
+  # File upload limits - bank statement PDFs/CSVs are usually small,
+  # but we allow up to 20MB to comfortably cover multi-year statements.
+  # ------------------------------------------------------------------
+  servlet:
+    multipart:
+      max-file-size: 20MB
+      max-request-size: 20MB
+
+  # ------------------------------------------------------------------
+  # Kafka producer
+  # ------------------------------------------------------------------
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      # Keys/values are sent as JSON strings via Spring Kafka's
+      # JsonSerializer, so downstream consumers (parsing-service, and
+      # the live-Kafka-visuals relay) can deserialize into POJOs or
+      # just read raw JSON without a schema registry.
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      acks: all              # wait for all in-sync replicas - do not lose ingestion events
+      retries: 3
+      properties:
+        # Prevents duplicate events on producer retry (e.g. after a
+        # transient network blip) - Kafka dedupes by sequence number.
+        enable.idempotence: true
+
+# Custom app-level constants, injected via @Value in the service/config classes
+finance-tracker:
+  kafka:
+    topics:
+      statement-ingested: statement.ingested
+  storage:
+    # Where uploaded raw statement files are written. In docker-compose
+    # this should be a mounted volume; in production, point this at an
+    # S3/MinIO-backed path (or swap persistToDisk() for an S3 client).
+    upload-dir: ${UPLOAD_DIR:/tmp/finance-tracker/uploads}
+  ocr:
+    # OCR configuration for scanned PDF support
+    enabled: ${OCR_ENABLED:true}
+    language: ${OCR_LANGUAGE:eng}
+    dpi: ${OCR_DPI:300}
+
+# ------------------------------------------------------------------
+# Actuator - expose health/info endpoints for Docker healthchecks and
+# for the API gateway to route around unhealthy instances.
+# ------------------------------------------------------------------
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always
+
+logging:
+  level:
+    com.financetracker: DEBUG
+    org.hibernate.SQL: WARN

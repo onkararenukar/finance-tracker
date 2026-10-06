@@ -1,0 +1,125 @@
+# application.yml - API Gateway
+
+server:
+  port: 8080   # THE public port for the whole platform - everything else stays internal
+
+spring:
+  application:
+    name: api-gateway
+
+  # Database configuration for user management
+  datasource:
+    url: ${DATABASE_URL:jdbc:postgresql://postgres:5432/financetracker}
+    username: ${DATABASE_USERNAME:finance_app}
+    password: ${DATABASE_PASSWORD:finance_app_pw}
+    driver-class-name: org.postgresql.Driver
+
+  jpa:
+    hibernate:
+      ddl-auto: none
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+    table: flyway_schema_history_gateway
+
+  cloud:
+    compatibility-verifier:
+      enabled: false
+    gateway:
+      # Global CORS so the (future) React dashboard, likely served from
+      # a different origin/port during development (e.g. localhost:5173),
+      # can call through the gateway without a separate proxy config.
+      globalcors:
+        cors-configurations:
+          '[/**]':
+            allowedOrigins: "${DASHBOARD_ORIGIN:http://localhost:5173}"
+            allowedMethods: [GET, POST, PUT, DELETE, OPTIONS]
+            allowedHeaders: "*"
+            allowCredentials: true
+
+      routes:
+        # Statement uploads (and any future ingestion-service endpoints)
+        - id: ingestion-service
+          uri: ${INGESTION_SERVICE_URL:http://localhost:8081}
+          predicates:
+            - Path=/api/v1/statements/**
+          filters:
+            # Adds a correlation id so a request can be traced across
+            # services in logs even though there's no distributed tracing
+            # backend (Zipkin/Tempo) wired up yet - a cheap, immediate
+            # win worth having from day one of the gateway existing.
+            - AddRequestHeader=X-Correlation-Id, ${random.uuid}
+
+        - id: categorization-categories
+          uri: ${CATEGORIZATION_SERVICE_URL:http://localhost:8083}
+          predicates:
+            - Path=/api/v1/categories/**
+          filters:
+            - AddRequestHeader=X-Correlation-Id, ${random.uuid}
+
+        - id: categorization-transactions
+          uri: ${CATEGORIZATION_SERVICE_URL:http://localhost:8083}
+          predicates:
+            - Path=/api/v1/transaction-categories/**
+          filters:
+            - AddRequestHeader=X-Correlation-Id, ${random.uuid}
+
+        - id: analytics-service
+          uri: ${ANALYTICS_SERVICE_URL:http://localhost:8084}
+          predicates:
+            - Path=/api/v1/analytics/**
+          filters:
+            - AddRequestHeader=X-Correlation-Id, ${random.uuid}
+
+        # NOTE: parsing-service has no public REST API (pure Kafka
+        # consumer/producer - see its module javadoc), so there's
+        # deliberately no route for it here.
+
+    # Kafka consumer for the live-events relay (see kafka/ package) -
+    # deliberately its own consumer group so this NEVER competes with
+    # parsing-service's or categorization-service's actual processing
+    # consumer groups for partition assignment.
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    consumer:
+      group-id: api-gateway-live-view
+      auto-offset-reset: latest   # only care about NEW traffic for the live view, not historical backlog
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+
+finance-tracker:
+  kafka:
+    # Every topic the live-events dashboard page should visualize, as a
+    # single comma-separated property (not a YAML list) - Spring Kafka's
+    # @KafkaListener resolves a comma-separated placeholder into multiple
+    # topics automatically, which keeps KafkaLiveEventListener's
+    # annotation a one-liner. Deliberately an explicit list (not a
+    # wildcard/regex subscription) so adding a topic to watch is a
+    # one-line config change, and we never accidentally pick up an
+    # unrelated topic a future service creates.
+    live-view-topics: statement.ingested,transaction.parsed,statement.ingested.DLT,transaction.parsed.DLT
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,gateway
+  endpoint:
+    health:
+      show-details: always
+
+logging:
+  level:
+    com.financetracker: DEBUG
+    org.springframework.cloud.gateway: INFO
+
+# Security configuration
+security:
+  jwt:
+    secret-key: ${JWT_SECRET:your-256-bit-secret-key-change-this-in-production-minimum-32-characters-long}
+    expiration: 86400000 # 24 hours in milliseconds

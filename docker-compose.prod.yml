@@ -1,0 +1,240 @@
+version: '3.9'
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: finance-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: financetracker
+      POSTGRES_USER: finance_app
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init-extensions.sql:/docker-entrypoint-initdb.d/init-extensions.sql
+    networks:
+      - finance-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U finance_app -d financetracker"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: finance-kafka
+    restart: unless-stopped
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://${EC2_PUBLIC_IP}:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    networks:
+      - finance-net
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  api-gateway:
+    image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:api-gateway-latest
+    container_name: finance-api-gateway
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      INGESTION_SERVICE_URL: http://ingestion-service:8081
+      CATEGORIZATION_SERVICE_URL: http://categorization-service:8083
+      ANALYTICS_SERVICE_URL: http://analytics-service:8084
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      DATABASE_URL: jdbc:postgresql://postgres:5432/financetracker
+      DATABASE_USERNAME: finance_app
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_REGION: ${AWS_REGION}
+      S3_BUCKET_NAME: ${S3_BUCKET_NAME}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    networks:
+      - finance-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: "awslogs"
+      options:
+        awslogs-region: "${AWS_REGION}"
+        awslogs-group: "/finance-tracker/application"
+        awslogs-stream: "api-gateway"
+
+  ingestion-service:
+    image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:ingestion-latest
+    container_name: finance-ingestion-service
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: financetracker
+      DB_USER: finance_app
+      DB_PASS: ${POSTGRES_PASSWORD}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      UPLOAD_DIR: /data/uploads
+      FINANCE_TRACKER_OCR_ENABLED: "true"
+      FINANCE_TRACKER_OCR_LANGUAGE: "eng"
+      FINANCE_TRACKER_OCR_DPI: "300"
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_REGION: ${AWS_REGION}
+      S3_BUCKET_NAME: ${S3_BUCKET_NAME}
+    volumes:
+      - uploads:/data/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    networks:
+      - finance-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: "awslogs"
+      options:
+        awslogs-region: "${AWS_REGION}"
+        awslogs-group: "/finance-tracker/application"
+        awslogs-stream: "ingestion-service"
+
+  parsing-service:
+    image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:parsing-latest
+    container_name: finance-parsing-service
+    restart: unless-stopped
+    ports:
+      - "8082:8082"
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: financetracker
+      DB_USER: finance_app
+      DB_PASS: ${POSTGRES_PASSWORD}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      LLM_CHAT_BASE_URL: ${LLM_CHAT_BASE_URL:-http://host.docker.internal:11434}
+      LLM_CHAT_MODEL: ${LLM_CHAT_MODEL:-llama3.1}
+      LLM_EMBEDDING_BASE_URL: ${LLM_EMBEDDING_BASE_URL:-http://host.docker.internal:11434}
+      LLM_EMBEDDING_MODEL: ${LLM_EMBEDDING_MODEL:-nomic-embed-text}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      ingestion-service:
+        condition: service_started
+    networks:
+      - finance-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8082/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: "awslogs"
+      options:
+        awslogs-region: "${AWS_REGION}"
+        awslogs-group: "/finance-tracker/application"
+        awslogs-stream: "parsing-service"
+
+  categorization-service:
+    image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:categorization-latest
+    container_name: finance-categorization-service
+    restart: unless-stopped
+    ports:
+      - "8083:8083"
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: financetracker
+      DB_USER: finance_app
+      DB_PASS: ${POSTGRES_PASSWORD}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      LLM_CHAT_BASE_URL: ${LLM_CHAT_BASE_URL:-http://host.docker.internal:11434}
+      LLM_CHAT_MODEL: ${LLM_CHAT_MODEL:-llama3.1}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      parsing-service:
+        condition: service_started
+    networks:
+      - finance-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: "awslogs"
+      options:
+        awslogs-region: "${AWS_REGION}"
+        awslogs-group: "/finance-tracker/application"
+        awslogs-stream: "categorization-service"
+
+  analytics-service:
+    image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:analytics-latest
+    container_name: finance-analytics-service
+    restart: unless-stopped
+    ports:
+      - "8084:8084"
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: financetracker
+      DB_USER: finance_app
+      DB_PASS: ${POSTGRES_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      parsing-service:
+        condition: service_started
+      categorization-service:
+        condition: service_started
+    networks:
+      - finance-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8084/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: "awslogs"
+      options:
+        awslogs-region: "${AWS_REGION}"
+        awslogs-group: "/finance-tracker/application"
+        awslogs-stream: "analytics-service"
+
+networks:
+  finance-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  uploads:

@@ -1,0 +1,10 @@
+# Test-only overrides layered on top of src/main/resources/application.yml.
+#
+# spring.embedded.kafka.brokers is a property automatically injected by
+# the @EmbeddedKafka JUnit extension with the actual bootstrap address of
+# the in-JVM broker it started for the test - we just need to point our
+# own bootstrap-servers property at it instead of the real docker-compose
+# Kafka on localhost:9092.
+spring:
+  kafka:
+    bootstrap-servers: ${spring.embedded.kafka.brokers}

@@ -1,0 +1,130 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    sms-sync-agent/pom.xml
+
+    WHAT THIS IS: a small, standalone command-line Java app meant to run
+    directly on your Mac (NOT in Docker, NOT in docker-compose) with
+    Full Disk Access granted in System Settings so it can read
+    ~/Library/Messages/chat.db. It reads new bank-related text messages,
+    groups them by bank, and uploads them to ingestion-service's existing
+    /api/v1/statements upload endpoint as a synthetic CSV - no changes
+    needed to ingestion-service at all.
+
+    WHY NOT A CONTAINER: Docker Desktop on Mac runs containers inside a
+    Linux VM with no access to your Mac's file system unless explicitly
+    bind-mounted, and macOS's TCC (TransparencyConsent and Control)
+    privacy system blocks Full Disk Access to any process that isn't
+    individually authorized - Docker's VM process isn't, and granting it
+    access would expose your ENTIRE file system to every container you
+    ever run. A small native process you run and authorize yourself is
+    the only sane way to read Messages data.
+
+    WHY A PLAIN JAVA APP, NOT SPRING BOOT: this has no HTTP server, no
+    dependency injection complexity, and needs to be dead simple to run
+    (`java -jar sms-sync-agent.jar`) and to reason about when something
+    goes wrong reading a sensitive local database. Spring's startup
+    overhead and auto-configuration surface buy nothing here.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.financetracker</groupId>
+        <artifactId>finance-tracker-parent</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>sms-sync-agent</artifactId>
+    <packaging>jar</packaging>
+    <name>Finance Tracker - SMS Sync Agent (runs on macOS host, not Docker)</name>
+
+    <dependencies>
+        <!-- Pure-Java SQLite JDBC driver - chat.db is a SQLite database.
+             No server, no native install needed beyond this one jar. -->
+        <dependency>
+            <groupId>org.xerial</groupId>
+            <artifactId>sqlite-jdbc</artifactId>
+            <version>3.47.1.0</version>
+        </dependency>
+
+        <!-- For building the multipart upload to ingestion-service and
+             parsing its JSON response - lightweight, no Spring needed. -->
+        <dependency>
+            <groupId>com.squareup.okhttp3</groupId>
+            <artifactId>okhttp</artifactId>
+            <version>4.12.0</version>
+        </dependency>
+
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>2.18.2</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>2.0.16</version>
+        </dependency>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-simple</artifactId>
+            <version>2.0.16</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>5.11.4</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <version>3.26.3</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <finalName>sms-sync-agent</finalName>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+            </plugin>
+            <!-- Builds a single runnable "fat jar" with all dependencies
+                 bundled - so running the agent is just `java -jar
+                 sms-sync-agent.jar`, no classpath juggling on your Mac. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.6.0</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <mainClass>com.financetracker.smsagent.SmsSyncAgentApplication</mainClass>
+                                </transformer>
+                            </transformers>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>

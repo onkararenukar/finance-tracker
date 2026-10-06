@@ -1,0 +1,489 @@
+name: Deploy to AWS EC2
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: finance-tracker
+  JAVA_VERSION: '21'
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up JDK ${{ env.JAVA_VERSION }}
+      uses: actions/setup-java@v3
+      with:
+        java-version: ${{ env.JAVA_VERSION }}
+        distribution: 'temurin'
+        cache: 'maven'
+
+    - name: Run unit tests
+      run: mvn test
+
+    - name: Generate test coverage report
+      run: mvn jacoco:report
+
+    - name: Upload coverage reports
+      uses: actions/upload-artifact@v3
+      with:
+        name: coverage-reports
+        path: '**/target/site/jacoco/'
+
+  build:
+    name: Build and Push Docker Images
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up JDK ${{ env.JAVA_VERSION }}
+      uses: actions/setup-java@v3
+      with:
+        java-version: ${{ env.JAVA_VERSION }}
+        distribution: 'temurin'
+        cache: 'maven'
+
+    - name: Build with Maven
+      run: mvn clean package -DskipTests
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+
+    - name: Cache Docker layers
+      uses: actions/cache@v3
+      with:
+        path: /tmp/.buildx-cache
+        key: ${{ runner.os }}-buildx-${{ github.sha }}
+        restore-keys: |
+          ${{ runner.os }}-buildx-
+
+    - name: Build and push Docker images
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ github.sha }}
+        LATEST_TAG: latest
+      run: |
+        # Build API Gateway
+        docker buildx build \
+          --cache-from type=local,src=/tmp/.buildx-cache \
+          --cache-to type=local,dest=/tmp/.buildx-cache-new,mode=max \
+          -t $ECR_REGISTRY/$ECR_REPOSITORY:api-gateway-$IMAGE_TAG \
+          -t $ECR_REGISTRY/$ECR_REPOSITORY:api-gateway-$LATEST_TAG \
+          -f api-gateway/Dockerfile \
+          --push \
+          .
+        
+        # Build Ingestion Service
+        docker buildx build \
+          --cache-from type=local,src=/tmp/.buildx-cache \
+          --cache-to type=local,dest=/tmp/.buildx-cache-new,mode=max \
+          -t $ECR_REGISTRY/$ECR_REPOSITORY:ingestion-$IMAGE_TAG \
+          -t $ECR_REGISTRY/$ECR_REPOSITORY:ingestion-$LATEST_TAG \
+          -f ingestion-service/Dockerfile \
+          --push \
+          .
+        
+        # Build Parsing Service
+        docker buildx build \
+          --cache-from type=local,src=/tmp/.buildx-cache \
+          --cache-to type=local,dest=/tmp/.buildx-cache-new,mode=max \
+          -t $ECR_REGISTRY/$ECR_REPOSITORY:parsing-$IMAGE_TAG \
+          -t $ECR_REGISTRY/$ECR_REPOSITORY:parsing-$LATEST_TAG \
+          -f parsing-service/Dockerfile \
+          --push \
+          .
+        
+        # Build Categorization Service
+        docker buildx build \
+          --cache-from type=local,src=/tmp/.buildx-cache \
+          --cache-to type=local,dest=/tmp/.buildx-cache-new,mode=max \
+          -t $ECR_REGISTRY/$ECR_REPOSITORY:categorization-$IMAGE_TAG \
+          -t $ECR_REGISTRY/$ECR_REPOSITORY:categorization-$LATEST_TAG \
+          -f categorization-service/Dockerfile \
+          --push \
+          .
+        
+        # Build Analytics Service
+        docker buildx build \
+          --cache-from type=local,src=/tmp/.buildx-cache \
+          --cache-to type=local,dest=/tmp/.buildx-cache-new,mode=max \
+          -t $ECR_REGISTRY/$ECR_REPOSITORY:analytics-$IMAGE_TAG \
+          -t $ECR_REGISTRY/$ECR_REPOSITORY:analytics-$LATEST_TAG \
+          -f analytics-service/Dockerfile \
+          --push \
+          .
+        
+        # Move cache
+        rm -rf /tmp/.buildx-cache
+        mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Create production docker-compose.yml
+      run: |
+        cat > docker-compose.prod.yml << 'EOF'
+        version: '3.9'
+        
+        services:
+          postgres:
+            image: pgvector/pgvector:pg16
+            container_name: finance-postgres
+            restart: unless-stopped
+            environment:
+              POSTGRES_DB: financetracker
+              POSTGRES_USER: finance_app
+              POSTGRES_PASSWORD: \${POSTGRES_PASSWORD}
+            volumes:
+              - postgres_data:/var/lib/postgresql/data
+              - ./infra/postgres/init-extensions.sql:/docker-entrypoint-initdb.d/init-extensions.sql
+            networks:
+              - finance-net
+            healthcheck:
+              test: ["CMD-SHELL", "pg_isready -U finance_app -d financetracker"]
+              interval: 10s
+              timeout: 5s
+              retries: 5
+        
+          kafka:
+            image: apache/kafka:3.8.0
+            container_name: finance-kafka
+            restart: unless-stopped
+            environment:
+              KAFKA_NODE_ID: 1
+              KAFKA_PROCESS_ROLES: broker,controller
+              KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+              KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://\${EC2_PUBLIC_IP}:9092
+              KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+              KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+              KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+              KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+              KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+              KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+              KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+            networks:
+              - finance-net
+            healthcheck:
+              test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"]
+              interval: 10s
+              timeout: 10s
+              retries: 5
+        
+          api-gateway:
+            image: \${ECR_REGISTRY}/\${ECR_REPOSITORY}:api-gateway-latest
+            container_name: finance-api-gateway
+            restart: unless-stopped
+            ports:
+              - "8080:8080"
+            environment:
+              INGESTION_SERVICE_URL: http://ingestion-service:8081
+              CATEGORIZATION_SERVICE_URL: http://categorization-service:8083
+              ANALYTICS_SERVICE_URL: http://analytics-service:8084
+              KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+              DATABASE_URL: jdbc:postgresql://postgres:5432/financetracker
+              DATABASE_USERNAME: finance_app
+              DATABASE_PASSWORD: \${POSTGRES_PASSWORD}
+              JWT_SECRET: \${JWT_SECRET}
+              AWS_ACCESS_KEY_ID: \${AWS_ACCESS_KEY_ID}
+              AWS_SECRET_ACCESS_KEY: \${AWS_SECRET_ACCESS_KEY}
+              AWS_REGION: \${AWS_REGION}
+              S3_BUCKET_NAME: \${S3_BUCKET_NAME}
+            depends_on:
+              postgres:
+                condition: service_healthy
+              kafka:
+                condition: service_healthy
+            networks:
+              - finance-net
+            healthcheck:
+              test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health"]
+              interval: 30s
+              timeout: 10s
+              retries: 3
+        
+          ingestion-service:
+            image: \${ECR_REGISTRY}/\${ECR_REPOSITORY}:ingestion-latest
+            container_name: finance-ingestion-service
+            restart: unless-stopped
+            ports:
+              - "8081:8081"
+            environment:
+              DB_HOST: postgres
+              DB_PORT: 5432
+              DB_NAME: financetracker
+              DB_USER: finance_app
+              DB_PASS: \${POSTGRES_PASSWORD}
+              KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+              UPLOAD_DIR: /data/uploads
+              FINANCE_TRACKER_OCR_ENABLED: "true"
+              FINANCE_TRACKER_OCR_LANGUAGE: "eng"
+              FINANCE_TRACKER_OCR_DPI: "300"
+              AWS_ACCESS_KEY_ID: \${AWS_ACCESS_KEY_ID}
+              AWS_SECRET_ACCESS_KEY: \${AWS_SECRET_ACCESS_KEY}
+              AWS_REGION: \${AWS_REGION}
+              S3_BUCKET_NAME: \${S3_BUCKET_NAME}
+            volumes:
+              - uploads:/data/uploads
+            depends_on:
+              postgres:
+                condition: service_healthy
+              kafka:
+                condition: service_healthy
+            networks:
+              - finance-net
+            healthcheck:
+              test: ["CMD", "curl", "-f", "http://localhost:8081/actuator/health"]
+              interval: 30s
+              timeout: 10s
+              retries: 3
+        
+          parsing-service:
+            image: \${ECR_REGISTRY}/\${ECR_REPOSITORY}:parsing-latest
+            container_name: finance-parsing-service
+            restart: unless-stopped
+            ports:
+              - "8082:8082"
+            environment:
+              DB_HOST: postgres
+              DB_PORT: 5432
+              DB_NAME: financetracker
+              DB_USER: finance_app
+              DB_PASS: \${POSTGRES_PASSWORD}
+              KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+              LLM_CHAT_BASE_URL: \${LLM_CHAT_BASE_URL:-http://host.docker.internal:11434}
+              LLM_CHAT_MODEL: \${LLM_CHAT_MODEL:-llama3.1}
+              LLM_EMBEDDING_BASE_URL: \${LLM_EMBEDDING_BASE_URL:-http://host.docker.internal:11434}
+              LLM_EMBEDDING_MODEL: \${LLM_EMBEDDING_MODEL:-nomic-embed-text}
+            depends_on:
+              postgres:
+                condition: service_healthy
+              kafka:
+                condition: service_healthy
+              ingestion-service:
+                condition: service_started
+            networks:
+              - finance-net
+            healthcheck:
+              test: ["CMD", "curl", "-f", "http://localhost:8082/actuator/health"]
+              interval: 30s
+              timeout: 10s
+              retries: 3
+        
+          categorization-service:
+            image: \${ECR_REGISTRY}/\${ECR_REPOSITORY}:categorization-latest
+            container_name: finance-categorization-service
+            restart: unless-stopped
+            ports:
+              - "8083:8083"
+            environment:
+              DB_HOST: postgres
+              DB_PORT: 5432
+              DB_NAME: financetracker
+              DB_USER: finance_app
+              DB_PASS: \${POSTGRES_PASSWORD}
+              KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+              LLM_CHAT_BASE_URL: \${LLM_CHAT_BASE_URL:-http://host.docker.internal:11434}
+              LLM_CHAT_MODEL: \${LLM_CHAT_MODEL:-llama3.1}
+            depends_on:
+              postgres:
+                condition: service_healthy
+              kafka:
+                condition: service_healthy
+              parsing-service:
+                condition: service_started
+            networks:
+              - finance-net
+            healthcheck:
+              test: ["CMD", "curl", "-f", "http://localhost:8083/actuator/health"]
+              interval: 30s
+              timeout: 10s
+              retries: 3
+        
+          analytics-service:
+            image: \${ECR_REGISTRY}/\${ECR_REPOSITORY}:analytics-latest
+            container_name: finance-analytics-service
+            restart: unless-stopped
+            ports:
+              - "8084:8084"
+            environment:
+              DB_HOST: postgres
+              DB_PORT: 5432
+              DB_NAME: financetracker
+              DB_USER: finance_app
+              DB_PASS: \${POSTGRES_PASSWORD}
+            depends_on:
+              postgres:
+                condition: service_healthy
+              parsing-service:
+                condition: service_started
+              categorization-service:
+                condition: service_started
+            networks:
+              - finance-net
+            healthcheck:
+              test: ["CMD", "curl", "-f", "http://localhost:8084/actuator/health"]
+              interval: 30s
+              timeout: 10s
+              retries: 3
+        
+        networks:
+          finance-net:
+            driver: bridge
+        
+        volumes:
+          postgres_data:
+          uploads:
+        EOF
+
+    - name: Deploy to EC2
+      env:
+        PRIVATE_KEY: ${{ secrets.EC2_PRIVATE_KEY }}
+        EC2_HOST: ${{ secrets.EC2_HOST }}
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+        JWT_SECRET: ${{ secrets.JWT_SECRET }}
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+        EC2_PUBLIC_IP: ${{ secrets.EC2_PUBLIC_IP }}
+      run: |
+        echo "$PRIVATE_KEY" > private_key.pem
+        chmod 600 private_key.pem
+        
+        # Deploy to EC2
+        ssh -o StrictHostKeyChecking=no -i private_key.pem ubuntu@$EC2_HOST << 'ENDSSH'
+          # Create directory if it doesn't exist
+          mkdir -p /home/ubuntu/finance-tracker
+          cd /home/ubuntu/finance-tracker
+          
+          # Login to ECR
+          aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin $ECR_REGISTRY
+          
+          # Pull latest images
+          docker pull $ECR_REGISTRY/$ECR_REPOSITORY:api-gateway-latest
+          docker pull $ECR_REGISTRY/$ECR_REPOSITORY:ingestion-latest
+          docker pull $ECR_REGISTRY/$ECR_REPOSITORY:parsing-latest
+          docker pull $ECR_REGISTRY/$ECR_REPOSITORY:categorization-latest
+          docker pull $ECR_REGISTRY/$ECR_REPOSITORY:analytics-latest
+          
+          # Create environment file
+          cat > .env << ENVFILE
+          POSTGRES_PASSWORD=$POSTGRES_PASSWORD
+          JWT_SECRET=$JWT_SECRET
+          AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
+          AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
+          AWS_REGION=us-east-1
+          S3_BUCKET_NAME=$S3_BUCKET_NAME
+          EC2_PUBLIC_IP=$EC2_PUBLIC_IP
+          ECR_REGISTRY=$ECR_REGISTRY
+          ECR_REPOSITORY=$ECR_REPOSITORY
+          ENVFILE
+          
+          # Stop existing containers
+          docker-compose down || true
+          
+          # Start new containers
+          docker-compose -f docker-compose.prod.yml up -d
+          
+          # Wait for services to be healthy
+          sleep 60
+          
+          # Check service status
+          docker-compose ps
+        ENDSSH
+
+    - name: Run health checks
+      env:
+        EC2_HOST: ${{ secrets.EC2_HOST }}
+      run: |
+        echo "Waiting for services to start..."
+        sleep 60
+        
+        # Check API Gateway health
+        echo "Checking API Gateway health..."
+        curl -f http://$EC2_HOST:8080/actuator/health || exit 1
+        
+        # Check Ingestion Service health
+        echo "Checking Ingestion Service health..."
+        curl -f http://$EC2_HOST:8081/actuator/health || exit 1
+        
+        # Check Analytics Service health
+        echo "Checking Analytics Service health..."
+        curl -f http://$EC2_HOST:8084/actuator/health || exit 1
+        
+        echo "All health checks passed!"
+
+    - name: Notify deployment status
+      if: always()
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const status = '${{ job.status }}';
+          const message = `Deployment ${status === 'success' ? 'completed successfully' : 'failed'} for commit ${{ github.sha }}`;
+          console.log(message);
+
+  rollback:
+    name: Rollback Deployment
+    runs-on: ubuntu-latest
+    if: failure() && github.ref == 'refs/heads/main'
+    needs: [build, deploy]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+      with:
+        ref: ${{ github.event.before }}
+
+    - name: Rollback to previous version
+      env:
+        PRIVATE_KEY: ${{ secrets.EC2_PRIVATE_KEY }}
+        EC2_HOST: ${{ secrets.EC2_HOST }}
+      run: |
+        echo "$PRIVATE_KEY" > private_key.pem
+        chmod 600 private_key.pem
+        
+        ssh -o StrictHostKeyChecking=no -i private_key.pem ubuntu@$EC2_HOST << 'ENDSSH'
+          cd /home/ubuntu/finance-tracker
+          git checkout ${{ github.event.before }}
+          docker-compose down
+          docker-compose up -d
+        ENDSSH

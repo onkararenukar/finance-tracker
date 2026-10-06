@@ -1,0 +1,163 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    pom.xml (PARENT / AGGREGATOR)
+
+    This is the root Maven POM for the finance-tracker platform. It does two jobs:
+
+    1. AGGREGATION - lists every microservice module so a single
+       `mvn clean install` from this directory builds all of them in the
+       correct dependency order.
+
+    2. DEPENDENCY MANAGEMENT - pins shared dependency versions (Spring Boot
+       BOM, Testcontainers BOM, Lombok, MapStruct...) in <dependencyManagement>
+       so every child module inherits consistent versions without repeating
+       them. Child modules just declare the dependency with no <version>.
+
+    As we build out more services (parsing-service, categorization-service,
+    analytics-service, api-gateway), they get added to <modules> below.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.financetracker</groupId>
+    <artifactId>finance-tracker-parent</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+    <packaging>pom</packaging>
+    <name>Finance Tracker - Parent</name>
+
+    <!--
+        Modules built so far. Add each new microservice's directory name
+        here as we scaffold it (e.g. "parsing-service", "api-gateway").
+    -->
+    <modules>
+        <module>ingestion-service</module>
+        <module>parsing-service</module>
+        <module>categorization-service</module>
+        <module>sms-sync-agent</module>
+        <module>api-gateway</module>
+        <module>analytics-service</module>
+    </modules>
+
+    <properties>
+        <!--
+            JAVA 21 - used as stable LTS version instead of Java 24/25
+            due to Maven compiler plugin compatibility issues with newer
+            JDK releases. This project uses virtual threads and other
+            modern Java features that are stable in Java 21.
+
+            NOTE: Some preview features mentioned in original design
+            (JEP 499, JEP 485, JEP 487) are not available in Java 21,
+            but the core functionality works with stable features.
+        -->
+        <java.version>21</java.version>
+        <maven.compiler.release>21</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+        <!-- Spring Boot 3.3.x for Java 21 compatibility -->
+        <spring-boot.version>3.3.5</spring-boot.version>
+        <testcontainers.version>1.20.4</testcontainers.version>
+        <mapstruct.version>1.6.3</mapstruct.version>
+        <lombok.version>1.18.38</lombok.version>
+        <!-- com.pgvector:pgvector - the official pgvector JDBC helper (registers
+             the `vector` PG type and binds float[] via PGvector objects) used by
+             any service that reads/writes embedding columns. -->
+        <pgvector.version>0.1.6</pgvector.version>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <!-- Pin Lombok explicitly — must come before the Spring Boot BOM import,
+             since spring-boot-dependencies for 3.4.2 manages Lombok at 1.18.36,
+             which predates JDK 24 support (added in 1.18.38) and silently
+             no-ops its annotation processing on JDK 24. -->
+            <dependency>
+                <groupId>org.projectlombok</groupId>
+                <artifactId>lombok</artifactId>
+                <version>${lombok.version}</version>
+            </dependency>
+            <!-- Spring Boot BOM - manages versions for all spring-boot-starter-* -->
+            <dependency>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-dependencies</artifactId>
+                <version>${spring-boot.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+
+            <!-- Testcontainers BOM - manages versions for all testcontainers-* modules -->
+            <dependency>
+                <groupId>org.testcontainers</groupId>
+                <artifactId>testcontainers-bom</artifactId>
+                <version>${testcontainers.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <build>
+        <pluginManagement>
+            <plugins>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-compiler-plugin</artifactId>
+                    <version>3.11.0</version>
+                    <configuration>
+                        <source>${java.version}</source>
+                        <target>${java.version}</target>
+                        <!-- Explicitly wire Lombok as an annotation processor. Required on
+                             JDK 23/24: Maven's default classpath-scanning discovery of
+                             annotation processors silently fails to pick up Lombok on these
+                             JDKs, so Lombok never runs even though it's a valid compile
+                             dependency (see https://github.com/projectlombok/lombok/issues/3846). -->
+                        <annotationProcessorPaths>
+                            <path>
+                                <groupId>org.projectlombok</groupId>
+                                <artifactId>lombok</artifactId>
+                                <version>${lombok.version}</version>
+                            </path>
+                        </annotationProcessorPaths>
+                    </configuration>
+                </plugin>
+
+                <!--
+                    Manages the version for spring-boot-maven-plugin (the plugin
+                    that repackages each service's jar into a runnable fat/uber
+                    jar via `mvn spring-boot:repackage`). Every Spring Boot child
+                    module declares this plugin with no <version>, so Maven
+                    resolves it from here. Tied to spring-boot.version above so
+                    it always matches the Spring Boot BOM used for dependencies.
+                -->
+                <plugin>
+                    <groupId>org.springframework.boot</groupId>
+                    <artifactId>spring-boot-maven-plugin</artifactId>
+                    <version>${spring-boot.version}</version>
+                </plugin>
+
+                <!-- JaCoCo Maven Plugin for test coverage -->
+                <plugin>
+                    <groupId>org.jacoco</groupId>
+                    <artifactId>jacoco-maven-plugin</artifactId>
+                    <version>0.8.11</version>
+                    <executions>
+                        <execution>
+                            <goals>
+                                <goal>prepare-agent</goal>
+                            </goals>
+                        </execution>
+                        <execution>
+                            <id>report</id>
+                            <phase>test</phase>
+                            <goals>
+                                <goal>report</goal>
+                            </goals>
+                        </execution>
+                    </executions>
+                </plugin>
+            </plugins>
+        </pluginManagement>
+    </build>
+
+</project>

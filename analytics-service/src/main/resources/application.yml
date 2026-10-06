@@ -1,0 +1,38 @@
+# application.yml - Analytics Service
+#
+# No spring.flyway.* block here on purpose - this service owns no
+# tables. It connects to the same Postgres database ingestion/parsing/
+# categorization services write to, purely to run read-only aggregation
+# queries - see pom.xml's javadoc for the full rationale.
+
+server:
+  port: 8084   # 8081=ingestion, 8082=parsing, 8083=categorization, 8084=analytics, 8080=gateway
+
+spring:
+  application:
+    name: analytics-service
+
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:financetracker}
+    username: ${DB_USER:finance_app}
+    password: ${DB_PASS:finance_app_pw}
+    hikari:
+      # Deliberately a SMALLER pool than the write-side services -
+      # analytics queries are typically fast aggregations, not held open
+      # across external calls, so fewer concurrent connections are needed.
+      maximum-pool-size: 5
+      minimum-idle: 2
+      connection-timeout: 30000
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always
+
+logging:
+  level:
+    com.financetracker: DEBUG
